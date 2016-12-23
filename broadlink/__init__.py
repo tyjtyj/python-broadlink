@@ -231,7 +231,7 @@ class device:
     while True:
       try:
         self.cs.sendto(packet, self.host)
-        self.cs.settimeout(1)
+        self.cs.settimeout(self.timeout)
         response = self.cs.recvfrom(1024)
         break
       except socket.timeout:
