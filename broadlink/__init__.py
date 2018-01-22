@@ -1,10 +1,17 @@
 #!/usr/bin/python
 
 from datetime import datetime
-from Crypto.Cipher import AES
+try:
+    from Crypto.Cipher import AES
+except ImportError as e:
+    import pyaes
+
 import time
 import random
 import socket
+import sys
+import threading
+import codecs
 
 def gendevice(devtype, host, mac):
   if devtype == 0: # SP1
@@ -16,6 +23,8 @@ def gendevice(devtype, host, mac):
   if devtype == 0x2720: # SPMini
     return sp2(host=host, mac=mac)
   elif devtype == 0x753e: # SP3
+    return sp2(host=host, mac=mac)
+  elif devtype == 0x947a or devtype == 0x9479: # SP3S
     return sp2(host=host, mac=mac)
   elif devtype == 0x2728: # SPMini2
     return sp2(host=host, mac=mac)
@@ -45,18 +54,25 @@ def gendevice(devtype, host, mac):
     return rm(host=host, mac=mac)
   elif devtype == 0x2714: # A1
     return a1(host=host, mac=mac)
+  elif devtype == 0x4EB5 or devtype == 0x4EF7: # MP1: 0x4eb5, honyar oem mp1: 0x4ef7
+    return mp1(host=host, mac=mac)
+  elif devtype == 0x2722: # S1 (SmartOne Alarm Kit)
+    return S1C(host=host, mac=mac)
+  elif devtype == 0x4E4D: # Dooya DT360E (DOOYA_CURTAIN_V2)
+    return dooya(host=host, mac=mac)
   else:
     return device(host=host, mac=mac)
 
-def discover(timeout=None):
-  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-  s.connect(('8.8.8.8', 53))  # connecting to a UDP address doesn't send packets
-  local_ip_address = s.getsockname()[0]
+def discover(timeout=None, local_ip_address=None):
+  if local_ip_address is None:
+      s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+      s.connect(('8.8.8.8', 53))  # connecting to a UDP address doesn't send packets
+      local_ip_address = s.getsockname()[0]
   address = local_ip_address.split('.')
   cs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   cs.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
   cs.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-  cs.bind(('',0))
+  cs.bind((local_ip_address,0))
   port = cs.getsockname()[1]
   starttime = time.time()
 
@@ -122,6 +138,7 @@ def discover(timeout=None):
       mac = responsepacket[0x3a:0x40]
       dev = gendevice(devtype, host, mac)
       devices.append(dev)
+    return devices
 
 
 class device:
@@ -138,6 +155,30 @@ class device:
     self.cs.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     self.cs.bind(('',0))
     self.type = "Unknown"
+    self.lock = threading.Lock()
+
+    if 'pyaes' in sys.modules:
+        self.encrypt = self.encrypt_pyaes
+        self.decrypt = self.decrypt_pyaes
+    else:
+        self.encrypt = self.encrypt_pycrypto
+        self.decrypt = self.decrypt_pycrypto
+
+  def encrypt_pyaes(self, payload):
+    aes = pyaes.AESModeOfOperationCBC(self.key, iv = bytes(self.iv))
+    return "".join([aes.encrypt(bytes(payload[i:i+16])) for i in range(0, len(payload), 16)])
+
+  def decrypt_pyaes(self, payload):
+    aes = pyaes.AESModeOfOperationCBC(self.key, iv = bytes(self.iv))
+    return "".join([aes.decrypt(bytes(payload[i:i+16])) for i in range(0, len(payload), 16)])
+
+  def encrypt_pycrypto(self, payload):
+    aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
+    return aes.encrypt(bytes(payload))
+
+  def decrypt_pycrypto(self, payload):
+    aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
+    return aes.decrypt(bytes(payload))
 
   def auth(self):
     payload = bytearray(0x50)
@@ -168,13 +209,18 @@ class device:
 
     response = self.send_packet(0x65, payload)
 
-    enc_payload = response[0x38:]
+    payload = self.decrypt(response[0x38:])
 
-    aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-    payload = aes.decrypt(bytes(enc_payload))
+    if not payload:
+     return False
+
+    key = payload[0x04:0x14]
+    if len(key) % 16 != 0:
+     return False
 
     self.id = payload[0x00:0x04]
-    self.key = payload[0x04:0x14]
+    self.key = key
+    return True
 
   def get_type(self):
     return self.type
@@ -206,13 +252,17 @@ class device:
     packet[0x32] = self.id[2]
     packet[0x33] = self.id[3]
 
+    # pad the payload for AES encryption
+    if len(payload)>0:
+      numpad=(len(payload)//16+1)*16
+      payload=payload.ljust(numpad,b"\x00")
+
     checksum = 0xbeaf
     for i in range(len(payload)):
       checksum += payload[i]
       checksum = checksum & 0xffff
 
-    aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-    payload = aes.encrypt(bytes(payload))
+    payload = self.encrypt(payload)
 
     packet[0x34] = checksum & 0xff
     packet[0x35] = checksum >> 8
@@ -228,17 +278,80 @@ class device:
     packet[0x21] = checksum >> 8
 
     starttime = time.time()
-    while True:
-      try:
-        self.cs.sendto(packet, self.host)
-        self.cs.settimeout(1)
-        response = self.cs.recvfrom(1024)
-        break
-      except socket.timeout:
-        if (time.time() - starttime) < self.timeout:
-          pass
-        raise
+    with self.lock:
+      while True:
+        try:
+          self.cs.sendto(packet, self.host)
+          self.cs.settimeout(1)
+          response = self.cs.recvfrom(2048)
+          break
+        except socket.timeout:
+          if (time.time() - starttime) > self.timeout:
+            raise
     return bytearray(response[0])
+
+
+class mp1(device):
+  def __init__ (self, host, mac):
+    device.__init__(self, host, mac)
+    self.type = "MP1"
+
+  def set_power_mask(self, sid_mask, state):
+    """Sets the power state of the smart power strip."""
+
+    packet = bytearray(16)
+    packet[0x00] = 0x0d
+    packet[0x02] = 0xa5
+    packet[0x03] = 0xa5
+    packet[0x04] = 0x5a
+    packet[0x05] = 0x5a
+    packet[0x06] = 0xb2 + ((sid_mask<<1) if state else sid_mask)
+    packet[0x07] = 0xc0
+    packet[0x08] = 0x02
+    packet[0x0a] = 0x03
+    packet[0x0d] = sid_mask
+    packet[0x0e] = sid_mask if state else 0
+
+    response = self.send_packet(0x6a, packet)
+
+    err = response[0x22] | (response[0x23] << 8)
+
+  def set_power(self, sid, state):
+    """Sets the power state of the smart power strip."""
+    sid_mask = 0x01 << (sid - 1)
+    return self.set_power_mask(sid_mask, state)
+
+  def check_power_raw(self):
+    """Returns the power state of the smart power strip in raw format."""
+    packet = bytearray(16)
+    packet[0x00] = 0x0a
+    packet[0x02] = 0xa5
+    packet[0x03] = 0xa5
+    packet[0x04] = 0x5a
+    packet[0x05] = 0x5a
+    packet[0x06] = 0xae
+    packet[0x07] = 0xc0
+    packet[0x08] = 0x01
+
+    response = self.send_packet(0x6a, packet)
+    err = response[0x22] | (response[0x23] << 8)
+    if err == 0:
+      payload = self.decrypt(bytes(response[0x38:]))
+      if type(payload[0x4]) == int:
+        state = payload[0x0e]
+      else:
+        state = ord(payload[0x0e])
+      return state
+
+  def check_power(self):
+    """Returns the power state of the smart power strip."""
+    state = self.check_power_raw()
+    data = {}
+    data['s1'] = bool(state & 0x01)
+    data['s2'] = bool(state & 0x02)
+    data['s3'] = bool(state & 0x04)
+    data['s4'] = bool(state & 0x08)
+    return data
 
 
 class sp1(device):
@@ -271,9 +384,22 @@ class sp2(device):
     response = self.send_packet(0x6a, packet)
     err = response[0x22] | (response[0x23] << 8)
     if err == 0:
-      aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-      payload = aes.decrypt(bytes(response[0x38:]))
-      return bool(payload[0x4])
+      payload = self.decrypt(bytes(response[0x38:]))
+      if type(payload[0x4]) == int:
+        state = bool(payload[0x4])
+      else:
+        state = bool(ord(payload[0x4]))
+      return state
+
+  def get_energy(self):
+    packet = bytearray([8, 0, 254, 1, 5, 1, 0, 0, 0, 45])
+    response = self.send_packet(0x6a, packet)
+    err = response[0x22] | (response[0x23] << 8)
+    if err == 0:
+      payload = self.decrypt(bytes(response[0x38:]))
+      energy = int(hex(ord(payload[7]) * 256 + ord(payload[6]))[2:]) + int(hex(ord(payload[5]))[2:])/100.0
+      return energy
+
 
 class a1(device):
   def __init__ (self, host, mac):
@@ -287,8 +413,7 @@ class a1(device):
     err = response[0x22] | (response[0x23] << 8)
     if err == 0:
       data = {}
-      aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-      payload = aes.decrypt(bytes(response[0x38:]))
+      payload = self.decrypt(bytes(response[0x38:]))
       if type(payload[0x4]) == int:
         data['temperature'] = (payload[0x4] * 10 + payload[0x5]) / 10.0
         data['humidity'] = (payload[0x6] * 10 + payload[0x7]) / 10.0
@@ -338,8 +463,7 @@ class a1(device):
     err = response[0x22] | (response[0x23] << 8)
     if err == 0:
       data = {}
-      aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-      payload = aes.decrypt(bytes(response[0x38:]))
+      payload = self.decrypt(bytes(response[0x38:]))
       if type(payload[0x4]) == int:
         data['temperature'] = (payload[0x4] * 10 + payload[0x5]) / 10.0
         data['humidity'] = (payload[0x6] * 10 + payload[0x7]) / 10.0
@@ -366,8 +490,7 @@ class rm(device):
     response = self.send_packet(0x6a, packet)
     err = response[0x22] | (response[0x23] << 8)
     if err == 0:
-      aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-      payload = aes.decrypt(bytes(response[0x38:]))
+      payload = self.decrypt(bytes(response[0x38:]))
       return payload[0x04:]
 
   def send_data(self, data):
@@ -386,8 +509,7 @@ class rm(device):
     response = self.send_packet(0x6a, packet)
     err = response[0x22] | (response[0x23] << 8)
     if err == 0:
-      aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-      payload = aes.decrypt(bytes(response[0x38:]))
+      payload = self.decrypt(bytes(response[0x38:]))
       if type(payload[0x4]) == int:
         temp = (payload[0x4] * 10 + payload[0x5]) / 10.0
       else:
@@ -403,3 +525,143 @@ class rm2(rm):
     dev = discover()
     self.host = dev.host
     self.mac = dev.mac
+
+
+S1C_SENSORS_TYPES = {
+    0x31: 'Door Sensor',  # 49 as hex
+    0x91: 'Key Fob',  # 145 as hex, as serial on fob corpse
+    0x21: 'Motion Sensor'  # 33 as hex
+}
+
+
+class S1C(device):
+  """
+  Its VERY VERY VERY DIRTY IMPLEMENTATION of S1C
+  """
+  def __init__(self, *a, **kw):
+    device.__init__(self, *a, **kw)
+    self.type = 'S1C'
+
+  def get_sensors_status(self):
+    packet = bytearray(16)
+    packet[0] = 0x06  # 0x06 - get sensors info, 0x07 - probably add sensors
+    response = self.send_packet(0x6a, packet)
+    err = response[0x22] | (response[0x23] << 8)
+    if err == 0:
+      aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
+
+      payload = aes.decrypt(bytes(response[0x38:]))
+      if payload:
+        head = payload[:4]
+        count = payload[0x4] #need to fix for python 2.x
+        sensors = payload[0x6:]
+        sensors_a = [bytearray(sensors[i * 83:(i + 1) * 83]) for i in range(len(sensors) // 83)]
+
+        sens_res = []
+        for sens in sensors_a:
+          status = ord(chr(sens[0]))
+          _name = str(bytes(sens[4:26]).decode())
+          _order = ord(chr(sens[1]))
+          _type = ord(chr(sens[3]))
+          _serial = bytes(codecs.encode(sens[26:30],"hex")).decode()
+
+          type_str = S1C_SENSORS_TYPES.get(_type, 'Unknown')
+
+          r = {
+            'status': status,
+            'name': _name.strip('\x00'),
+            'type': type_str,
+            'order': _order,
+            'serial': _serial,
+          }
+          if r['serial'] != '00000000':
+            sens_res.append(r)
+        result = {
+          'count': count,
+          'sensors': sens_res
+        }
+        return result
+
+
+class dooya(device):
+  def __init__ (self, host, mac):
+    device.__init__(self, host, mac)
+    self.type = "Dooya DT360E"
+
+  def _send(self, magic1, magic2):
+    packet = bytearray(16)
+    packet[0] = 0x09
+    packet[2] = 0xbb
+    packet[3] = magic1
+    packet[4] = magic2
+    packet[9] = 0xfa
+    packet[10] = 0x44
+    response = self.send_packet(0x6a, packet)
+    err = response[0x22] | (response[0x23] << 8)
+    if err == 0:
+      payload = self.decrypt(bytes(response[0x38:]))
+      return ord(payload[4])
+
+  def open(self):
+    return self._send(0x01, 0x00)
+
+  def close(self):
+    return self._send(0x02, 0x00)
+
+  def stop(self):
+    return self._send(0x03, 0x00)
+
+  def get_percentage(self):
+    return self._send(0x06, 0x5d)
+
+  def set_percentage_and_wait(self, new_percentage):
+    current = self.get_percentage()
+    if current > new_percentage:
+      self.close()
+      while current is not None and current > new_percentage:
+        time.sleep(0.2)
+        current = self.get_percentage()
+
+    elif current < new_percentage:
+      self.open()
+      while current is not None and current < new_percentage:
+        time.sleep(0.2)
+        current = self.get_percentage()
+    self.stop()
+
+# Setup a new Broadlink device via AP Mode. Review the README to see how to enter AP Mode.
+# Only tested with Broadlink RM3 Mini (Blackbean)
+def setup(ssid, password, security_mode):
+  # Security mode options are (0 - none, 1 = WEP, 2 = WPA1, 3 = WPA2, 4 = WPA1/2)
+  payload = bytearray(0x88)
+  payload[0x26] = 0x14  # This seems to always be set to 14
+  # Add the SSID to the payload
+  ssid_start = 68
+  ssid_length = 0
+  for letter in ssid:
+    payload[(ssid_start + ssid_length)] = ord(letter)
+    ssid_length += 1
+  # Add the WiFi password to the payload
+  pass_start = 100
+  pass_length = 0
+  for letter in password:
+    payload[(pass_start + pass_length)] = ord(letter)
+    pass_length += 1
+
+  payload[0x84] = ssid_length  # Character length of SSID
+  payload[0x85] = pass_length  # Character length of password
+  payload[0x86] = security_mode  # Type of encryption (00 - none, 01 = WEP, 02 = WPA1, 03 = WPA2, 04 = WPA1/2)
+
+  checksum = 0xbeaf
+  for i in range(len(payload)):
+    checksum += payload[i]
+    checksum = checksum & 0xffff
+
+  payload[0x20] = checksum & 0xff  # Checksum 1 position
+  payload[0x21] = checksum >> 8  # Checksum 2 position
+
+  sock = socket.socket(socket.AF_INET,  # Internet
+                       socket.SOCK_DGRAM)  # UDP
+  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+  sock.sendto(payload, ('255.255.255.255', 80))
